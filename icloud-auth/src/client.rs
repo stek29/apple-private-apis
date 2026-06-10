@@ -17,7 +17,7 @@ use srp::{
     client::{SrpClient, SrpClientVerifier},
     groups::G_2048,
 };
-use log::{debug, error, info, warn};
+use log::{debug, error, warn};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
@@ -298,13 +298,24 @@ impl<T: AnisetteProvider> AppleAccount<T> {
         let mut response = _self.login_email_pass(&username, &password).await?;
         loop {
             match response {
-                // LoginState::NeedsDevice2FA => response = _self.send_2fa_to_devices().await?,
                 LoginState::Needs2FAVerification => {
                     response = _self.verify_2fa(tfa_closure()).await?
                 }
-                LoginState::NeedsSMS2FA | LoginState::NeedsDevice2FA => {
-                    _self.send_2fa_to_devices().await?;
-                    response = _self.send_sms_2fa_to_devices(1).await?
+                LoginState::NeedsDevice2FA => {
+                    response = _self.send_2fa_to_devices().await?
+                }
+                LoginState::NeedsSMS2FA => {
+                    let mut extras = _self.get_auth_extras().await?;
+                    if let Some(new_state) = extras.new_state.take() {
+                        response = new_state;
+                    } else {
+                        let phone_id = extras
+                            .trusted_phone_numbers
+                            .first()
+                            .ok_or(Error::NoTrustedPhoneNumbers)?
+                            .id;
+                        response = _self.send_sms_2fa_to_devices(phone_id).await?
+                    }
                 }
                 LoginState::NeedsSMS2FAVerification(body) => {
                     response = _self.verify_sms_2fa(tfa_closure(), body).await?
@@ -822,9 +833,11 @@ impl<T: AnisetteProvider> AppleAccount<T> {
 
         if !res.status().is_success() {
             let status = res.status();
-            let body = res.text().await.unwrap_or_default();
-            error!("send_2fa_to_devices failed: HTTP {} — body: {}", status, body);
-            return Err(Error::AuthSrp);
+            error!("send_2fa_to_devices failed: HTTP {}", status);
+            return Err(Error::AuthSrpWithMessage(
+                status.as_u16().into(),
+                "Trusted-device 2FA request failed".to_string(),
+            ));
         }
 
         return Ok(LoginState::Needs2FAVerification);
@@ -851,7 +864,12 @@ impl<T: AnisetteProvider> AppleAccount<T> {
             .send().await?;
 
         if !res.status().is_success() {
-            return Err(Error::AuthSrp);
+            let status = res.status();
+            error!("send_sms_2fa_to_devices failed: HTTP {}", status);
+            return Err(Error::AuthSrpWithMessage(
+                status.as_u16().into(),
+                "SMS 2FA request failed".to_string(),
+            ));
         }
 
         return Ok(LoginState::NeedsSMS2FAVerification(body));
@@ -867,15 +885,13 @@ impl<T: AnisetteProvider> AppleAccount<T> {
             .send().await?;
         let status = req.status().as_u16();
         if status == 403 {
-            let body = req.bytes().await?;
-            warn!("Got auth response {}", base64::encode(&body));
+            warn!("Failed to retrieve 2FA configuration: HTTP {status}");
             return Err(Error::FailedGetting2FAConfig);
         }
         let resp = req.bytes().await?;
-        info!("Got gsa auth extras {:?}", str::from_utf8(&resp).unwrap());
         let mut new_state: AuthenticationExtras = serde_json::from_slice(&resp)?;
         if new_state.trusted_phone_numbers.is_empty() {
-            return Err(Error::HardwareKeyError);
+            return Err(Error::NoTrustedPhoneNumbers);
         }
         if status == 201 {
             new_state.new_state = Some(LoginState::NeedsSMS2FAVerification(VerifyBody {
