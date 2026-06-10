@@ -94,6 +94,21 @@ pub struct FetchedToken {
     expiration: SystemTime,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CachedToken {
+    token: String,
+    expiration_ms: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AppleAccountCache {
+    version: u32,
+    pub username: String,
+    spd: Dictionary,
+    tokens: HashMap<String, CachedToken>,
+    hashed_password: Option<Vec<u8>>,
+}
+
 pub struct AppleAccount<T: AnisetteProvider> {
     //TODO: move this to omnisette
     pub anisette: ArcAnisetteClient<T>,
@@ -163,6 +178,45 @@ pub struct VerifyBody {
 pub enum GenerateVerificationTokenRequest {
     Passkey {
         client_data_hash: String,
+    }
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::{AppleAccountCache, CachedToken};
+    use plist::{Dictionary, Value};
+    use std::collections::HashMap;
+
+    #[test]
+    fn auth_cache_round_trips_through_plist() {
+        let cache = AppleAccountCache {
+            version: 1,
+            username: "person@example.com".to_string(),
+            spd: Dictionary::from_iter([(
+                "adsid".to_string(),
+                Value::String("12345".to_string()),
+            )]),
+            tokens: HashMap::from_iter([(
+                "com.apple.gs.idms.pet".to_string(),
+                CachedToken {
+                    token: "secret-token".to_string(),
+                    expiration_ms: 123_456,
+                },
+            )]),
+            hashed_password: Some(vec![1, 2, 3]),
+        };
+
+        let mut encoded = Vec::new();
+        plist::to_writer_xml(&mut encoded, &cache).unwrap();
+        let decoded: AppleAccountCache = plist::from_bytes(&encoded).unwrap();
+
+        assert_eq!(decoded.version, 1);
+        assert_eq!(decoded.username, "person@example.com");
+        assert_eq!(decoded.hashed_password, Some(vec![1, 2, 3]));
+        assert_eq!(
+            decoded.tokens["com.apple.gs.idms.pet"].token,
+            "secret-token"
+        );
     }
 }
 
@@ -238,6 +292,79 @@ impl<T: AnisetteProvider> AppleAccount<T> {
             username: None,
             tokens: HashMap::new(),
             hashed_password: None,
+        })
+    }
+
+    pub fn from_cache(
+        cache: AppleAccountCache,
+        client_info: LoginClientInfo,
+        anisette: ArcAnisetteClient<T>,
+    ) -> Result<Self, crate::Error> {
+        if cache.version != 1 {
+            return Err(Error::InvalidCache(format!(
+                "unsupported cache version {}",
+                cache.version
+            )));
+        }
+
+        let mut account = Self::new_with_anisette(client_info, anisette)?;
+        account.username = Some(cache.username);
+        account.spd = Some(cache.spd);
+        account.tokens = cache
+            .tokens
+            .into_iter()
+            .map(|(service, token)| {
+                (
+                    service,
+                    FetchedToken {
+                        token: token.token,
+                        expiration: SystemTime::UNIX_EPOCH
+                            + Duration::from_millis(token.expiration_ms),
+                    },
+                )
+            })
+            .collect();
+        account.hashed_password = cache.hashed_password;
+
+        Ok(account)
+    }
+
+    pub fn to_cache(&self) -> Result<AppleAccountCache, crate::Error> {
+        let username = self
+            .username
+            .clone()
+            .ok_or_else(|| Error::InvalidCache("account has no username".to_string()))?;
+        let spd = self
+            .spd
+            .clone()
+            .ok_or_else(|| Error::InvalidCache("account has no SPD data".to_string()))?;
+        let tokens = self
+            .tokens
+            .iter()
+            .map(|(service, token)| {
+                let expiration_ms = token
+                    .expiration
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis()
+                    .min(u64::MAX as u128) as u64;
+
+                (
+                    service.clone(),
+                    CachedToken {
+                        token: token.token.clone(),
+                        expiration_ms,
+                    },
+                )
+            })
+            .collect();
+
+        Ok(AppleAccountCache {
+            version: 1,
+            username,
+            spd,
+            tokens,
+            hashed_password: self.hashed_password.clone(),
         })
     }
 
