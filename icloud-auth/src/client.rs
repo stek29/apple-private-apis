@@ -152,6 +152,47 @@ pub enum LoginState {
     NeedsLogin,
 }
 
+#[derive(Debug, Clone)]
+pub enum SecondFactorMethod {
+    TrustedDevice,
+    Sms {
+        phone_id: u32,
+        display_number: String,
+    },
+}
+
+#[derive(Debug)]
+pub enum LoginStep {
+    Complete,
+    ChooseSecondFactor(Vec<SecondFactorMethod>),
+    EnterCode(PendingSecondFactor),
+}
+
+#[derive(Debug)]
+pub struct PendingSecondFactor {
+    kind: PendingSecondFactorKind,
+}
+
+#[derive(Debug)]
+enum PendingSecondFactorKind {
+    TrustedDevice,
+    Sms(VerifyBody),
+}
+
+impl PendingSecondFactor {
+    pub fn trusted_device() -> Self {
+        Self {
+            kind: PendingSecondFactorKind::TrustedDevice,
+        }
+    }
+
+    pub fn sms(body: VerifyBody) -> Self {
+        Self {
+            kind: PendingSecondFactorKind::Sms(body),
+        }
+    }
+}
+
 #[derive(Serialize, Debug, Clone)]
 struct VerifyCode {
     code: String,
@@ -217,6 +258,114 @@ mod cache_tests {
             decoded.tokens["com.apple.gs.idms.pet"].token,
             "secret-token"
         );
+    }
+}
+
+#[cfg(test)]
+mod login_step_tests {
+    use super::*;
+
+    #[test]
+    fn pending_second_factor_trusted_device_has_debug() {
+        let pending = PendingSecondFactor::trusted_device();
+        let debug = format!("{:?}", pending);
+        assert!(debug.contains("TrustedDevice"));
+    }
+
+    #[test]
+    fn pending_second_factor_sms_has_debug() {
+        let body = VerifyBody {
+            phone_number: PhoneNumber { id: 42 },
+            mode: "sms".to_string(),
+            security_code: None,
+        };
+        let pending = PendingSecondFactor::sms(body);
+        let debug = format!("{:?}", pending);
+        assert!(debug.contains("Sms"));
+        assert!(debug.contains("42"));
+    }
+
+    #[test]
+    fn second_factor_method_trusted_device() {
+        let method = SecondFactorMethod::TrustedDevice;
+        let debug = format!("{:?}", method);
+        assert_eq!(debug, "TrustedDevice");
+    }
+
+    #[test]
+    fn second_factor_method_sms() {
+        let method = SecondFactorMethod::Sms {
+            phone_id: 7,
+            display_number: "+1 (555) 123-4567".to_string(),
+        };
+        let debug = format!("{:?}", method);
+        assert!(debug.contains("Sms"));
+        assert!(debug.contains("7"));
+        assert!(debug.contains("+1 (555) 123-4567"));
+    }
+
+    #[test]
+    fn login_step_complete() {
+        let step = LoginStep::Complete;
+        let debug = format!("{:?}", step);
+        assert_eq!(debug, "Complete");
+    }
+
+    #[test]
+    fn login_step_choose_second_factor() {
+        let methods = vec![
+            SecondFactorMethod::TrustedDevice,
+            SecondFactorMethod::Sms {
+                phone_id: 1,
+                display_number: "+44 ••• •• •• 37".to_string(),
+            },
+        ];
+        let step = LoginStep::ChooseSecondFactor(methods);
+        let debug = format!("{:?}", step);
+        assert!(debug.contains("ChooseSecondFactor"));
+        assert!(debug.contains("TrustedDevice"));
+        assert!(debug.contains("+44"));
+    }
+
+    #[test]
+    fn login_step_enter_code() {
+        let body = VerifyBody {
+            phone_number: PhoneNumber { id: 3 },
+            mode: "sms".to_string(),
+            security_code: None,
+        };
+        let pending = PendingSecondFactor::sms(body);
+        let step = LoginStep::EnterCode(pending);
+        let debug = format!("{:?}", step);
+        assert!(debug.contains("EnterCode"));
+    }
+
+    #[test]
+    fn login_step_is_debug() {
+        let steps = vec![
+            LoginStep::Complete,
+            LoginStep::ChooseSecondFactor(vec![]),
+            LoginStep::EnterCode(PendingSecondFactor::trusted_device()),
+        ];
+        for step in steps {
+            let _ = format!("{:?}", step);
+        }
+    }
+
+    #[test]
+    fn second_factor_method_is_clone() {
+        let method = SecondFactorMethod::Sms {
+            phone_id: 5,
+            display_number: "+1 ••• •• •• 89".to_string(),
+        };
+        let cloned = method.clone();
+        match cloned {
+            SecondFactorMethod::Sms { phone_id, display_number } => {
+                assert_eq!(phone_id, 5);
+                assert_eq!(display_number, "+1 ••• •• •• 89");
+            }
+            _ => panic!("Expected Sms variant"),
+        }
     }
 }
 
@@ -460,6 +609,86 @@ impl<T: AnisetteProvider> AppleAccount<T> {
                 }
             }
         }
+    }
+
+    pub async fn login_step_start(
+        appleid_closure: impl Fn() -> (String, Vec<u8>),
+        client_info: LoginClientInfo,
+        anisette: ArcAnisetteClient<T>,
+    ) -> Result<(AppleAccount<T>, LoginStep), Error> {
+        let mut account = AppleAccount::new_with_anisette(client_info, anisette)?;
+        let (username, password) = appleid_closure();
+        let response = account.login_email_pass(&username, &password).await?;
+        let step = account.state_to_login_step(response).await?;
+        Ok((account, step))
+    }
+
+    async fn state_to_login_step(&self, state: LoginState) -> Result<LoginStep, Error> {
+        match state {
+            LoginState::LoggedIn => Ok(LoginStep::Complete),
+            LoginState::NeedsDevice2FA => {
+                let extras = self.get_auth_extras().await?;
+                let mut methods = vec![SecondFactorMethod::TrustedDevice];
+                for phone in &extras.trusted_phone_numbers {
+                    methods.push(SecondFactorMethod::Sms {
+                        phone_id: phone.id,
+                        display_number: phone.number_with_dial_code.clone(),
+                    });
+                }
+                Ok(LoginStep::ChooseSecondFactor(methods))
+            }
+            LoginState::NeedsSMS2FA => {
+                let extras = self.get_auth_extras().await?;
+                let methods: Vec<SecondFactorMethod> = extras
+                    .trusted_phone_numbers
+                    .iter()
+                    .map(|phone| SecondFactorMethod::Sms {
+                        phone_id: phone.id,
+                        display_number: phone.number_with_dial_code.clone(),
+                    })
+                    .collect();
+                if methods.is_empty() {
+                    return Err(Error::NoTrustedPhoneNumbers);
+                }
+                Ok(LoginStep::ChooseSecondFactor(methods))
+            }
+            LoginState::Needs2FAVerification => {
+                Ok(LoginStep::EnterCode(PendingSecondFactor::trusted_device()))
+            }
+            LoginState::NeedsSMS2FAVerification(body) => {
+                Ok(LoginStep::EnterCode(PendingSecondFactor::sms(body)))
+            }
+            LoginState::NeedsLogin => Err(Error::AuthSrpWithMessage(
+                0,
+                "Login session expired, please retry".to_string(),
+            )),
+            LoginState::NeedsExtraStep(step) => Err(Error::ExtraStep(step)),
+        }
+    }
+
+    pub async fn login_choose_method(
+        &mut self,
+        method: &SecondFactorMethod,
+    ) -> Result<LoginStep, Error> {
+        let response = match method {
+            SecondFactorMethod::TrustedDevice => self.send_2fa_to_devices().await?,
+            SecondFactorMethod::Sms { phone_id, .. } => {
+                self.send_sms_2fa_to_devices(*phone_id).await?
+            }
+        };
+        self.state_to_login_step(response).await
+    }
+
+    pub async fn login_submit_code(
+        &mut self,
+        pending: PendingSecondFactor,
+        code: String,
+    ) -> Result<LoginStep, Error> {
+        let response = match pending.kind {
+            PendingSecondFactorKind::TrustedDevice => self.verify_2fa(code).await?,
+            PendingSecondFactorKind::Sms(body) => self.verify_sms_2fa(code, body).await?,
+        };
+        self.state_to_login_step(response).await
     }
 
     pub fn get_pet(&self) -> Option<String> {
