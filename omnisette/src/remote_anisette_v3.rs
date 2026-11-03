@@ -347,7 +347,7 @@ impl AnisetteClient {
                     ProvisionInput::ProvisioningSuccess { adi_pb } => {
                         debug!("ProvisioningSuccess");
                         state.adi_pb = Some(base64_decode(&adi_pb));
-                        connection.close(None).await?;
+                        finish_provisioning(&mut connection).await?;
                         break;
                     }
                 }
@@ -482,5 +482,56 @@ mod provisioning_stream_tests {
     fn pending_connection_yields_to_caller() {
         let mut input = stream::pending();
         assert!(next_provisioning_frame(&mut input).now_or_never().is_none());
+    }
+}
+
+
+async fn finish_provisioning<S>(connection: &mut S) -> Result<(), AnisetteError>
+where
+    S: futures_util::Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
+{
+    // The provider has already returned ProvisioningSuccess. Its side may
+    // close first; a teardown error must not discard completed provisioning.
+    let _ = connection.close().await;
+    Ok(())
+}
+
+#[cfg(test)]
+mod completed_provisioning_tests {
+    use super::*;
+    use futures_util::Sink;
+    use std::{pin::Pin, task::{Context, Poll}};
+    use tokio_tungstenite::tungstenite::Error as WsError;
+
+    struct CompletedConnection { closed_by_server: bool, close_calls: usize }
+    impl Sink<Message> for CompletedConnection {
+        type Error = WsError;
+        fn poll_ready(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), WsError>> {
+            panic!("No more provisioning messages may be sent after success")
+        }
+        fn start_send(self: Pin<&mut Self>, _: Message) -> Result<(), WsError> {
+            panic!("No more provisioning messages may be sent after success")
+        }
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), WsError>> {
+            panic!("Only the close handshake remains after success")
+        }
+        fn poll_close(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), WsError>> {
+            self.close_calls += 1;
+            Poll::Ready(if self.closed_by_server { Err(WsError::ConnectionClosed) } else { Ok(()) })
+        }
+    }
+
+    #[tokio::test]
+    async fn success_is_preserved_when_server_already_closed() {
+        let mut connection = CompletedConnection { closed_by_server: true, close_calls: 0 };
+        finish_provisioning(&mut connection).await.unwrap();
+        assert_eq!(connection.close_calls, 1);
+    }
+
+    #[tokio::test]
+    async fn success_still_attempts_a_graceful_close() {
+        let mut connection = CompletedConnection { closed_by_server: false, close_calls: 0 };
+        finish_provisioning(&mut connection).await.unwrap();
+        assert_eq!(connection.close_calls, 1);
     }
 }
