@@ -28,7 +28,7 @@ pub enum Error {
     ReqwestError(#[from] reqwest::Error),
     #[error("Failed getting anisette data {0}")]
     ErrorGettingAnisette(#[from] omnisette::AnisetteError),
-    #[error("Disable Advanced Data Protection")]
+    #[error("Failed to retrieve two-factor authentication configuration")]
     FailedGetting2FAConfig,
     #[error("Serde Error")]
     SerdeError(#[from] serde_json::Error),

@@ -628,29 +628,11 @@ impl<T: AnisetteProvider> AppleAccount<T> {
             LoginState::LoggedIn => Ok(LoginStep::Complete),
             LoginState::NeedsDevice2FA => {
                 let extras = self.get_auth_extras().await?;
-                let mut methods = vec![SecondFactorMethod::TrustedDevice];
-                for phone in &extras.trusted_phone_numbers {
-                    methods.push(SecondFactorMethod::Sms {
-                        phone_id: phone.id,
-                        display_number: phone.number_with_dial_code.clone(),
-                    });
-                }
-                Ok(LoginStep::ChooseSecondFactor(methods))
+                second_factor_step(true, extras)
             }
             LoginState::NeedsSMS2FA => {
                 let extras = self.get_auth_extras().await?;
-                let methods: Vec<SecondFactorMethod> = extras
-                    .trusted_phone_numbers
-                    .iter()
-                    .map(|phone| SecondFactorMethod::Sms {
-                        phone_id: phone.id,
-                        display_number: phone.number_with_dial_code.clone(),
-                    })
-                    .collect();
-                if methods.is_empty() {
-                    return Err(Error::NoTrustedPhoneNumbers);
-                }
-                Ok(LoginStep::ChooseSecondFactor(methods))
+                second_factor_step(false, extras)
             }
             LoginState::Needs2FAVerification => {
                 Ok(LoginStep::EnterCode(PendingSecondFactor::trusted_device()))
@@ -1240,26 +1222,11 @@ impl<T: AnisetteProvider> AppleAccount<T> {
             .header("Accept", "application/json")
             .send().await?;
         let status = req.status().as_u16();
-        if status == 403 {
-            warn!("Failed to retrieve 2FA configuration: HTTP {status}");
+        if !req.status().is_success() {
             return Err(Error::FailedGetting2FAConfig);
         }
         let resp = req.bytes().await?;
-        let mut new_state: AuthenticationExtras = serde_json::from_slice(&resp)?;
-        if new_state.trusted_phone_numbers.is_empty() {
-            return Err(Error::NoTrustedPhoneNumbers);
-        }
-        if status == 201 {
-            new_state.new_state = Some(LoginState::NeedsSMS2FAVerification(VerifyBody {
-                phone_number: PhoneNumber {
-                    id: new_state.trusted_phone_numbers.first().unwrap().id
-                },
-                mode: "sms".to_string(),
-                security_code: None
-            }));
-        }
-
-        Ok(new_state)
+        parse_auth_extras(status, &resp)
     }
 
     pub async fn request_update_account(&self) -> Result<String, Error> {
@@ -1464,5 +1431,88 @@ impl<T: AnisetteProvider> AppleAccount<T> {
 
 
         Ok(headers)
+    }
+}
+
+
+fn parse_auth_extras(status: u16, body: &[u8]) -> Result<AuthenticationExtras, Error> {
+    if !(200..300).contains(&status) {
+        return Err(Error::FailedGetting2FAConfig);
+    }
+    let mut extras: AuthenticationExtras = serde_json::from_slice(body)?;
+    if status == 201 {
+        let phone = extras.trusted_phone_numbers.first().ok_or(Error::NoTrustedPhoneNumbers)?;
+        extras.new_state = Some(LoginState::NeedsSMS2FAVerification(VerifyBody {
+            phone_number: PhoneNumber { id: phone.id },
+            mode: "sms".to_string(),
+            security_code: None,
+        }));
+    }
+    Ok(extras)
+}
+
+fn second_factor_step(trusted_device: bool, extras: AuthenticationExtras) -> Result<LoginStep, Error> {
+    if let Some(LoginState::NeedsSMS2FAVerification(body)) = extras.new_state {
+        return Ok(LoginStep::EnterCode(PendingSecondFactor::sms(body)));
+    }
+    let mut methods = if trusted_device { vec![SecondFactorMethod::TrustedDevice] } else { vec![] };
+    methods.extend(extras.trusted_phone_numbers.iter().map(|phone| SecondFactorMethod::Sms {
+        phone_id: phone.id,
+        display_number: phone.number_with_dial_code.clone(),
+    }));
+    if methods.is_empty() {
+        return Err(Error::NoTrustedPhoneNumbers);
+    }
+    Ok(LoginStep::ChooseSecondFactor(methods))
+}
+
+#[cfg(test)]
+mod attended_two_factor_tests {
+    use super::*;
+    const NO_PHONES: &[u8] = br#"{"trustedPhoneNumbers":[]}"#;
+    const PHONE: &[u8] = br#"{"trustedPhoneNumbers":[{"numberWithDialCode":"+1 *** ** 42","lastTwoDigits":"42","pushMode":"sms","id":7}]}"#;
+
+    #[test]
+    fn trusted_device_without_sms_numbers_is_available() {
+        let extras = parse_auth_extras(200, NO_PHONES).unwrap();
+        let LoginStep::ChooseSecondFactor(methods) = second_factor_step(true, extras).unwrap() else { panic!() };
+        assert!(matches!(methods.as_slice(), [SecondFactorMethod::TrustedDevice]));
+    }
+
+    #[test]
+    fn sms_without_any_numbers_stays_unavailable() {
+        let extras = parse_auth_extras(200, NO_PHONES).unwrap();
+        assert!(matches!(second_factor_step(false, extras), Err(Error::NoTrustedPhoneNumbers)));
+    }
+
+    #[test]
+    fn already_sent_sms_enters_code_without_sending_again() {
+        for trusted_device in [true, false] {
+            let extras = parse_auth_extras(201, PHONE).unwrap();
+            let LoginStep::EnterCode(pending) = second_factor_step(trusted_device, extras).unwrap() else { panic!() };
+            let PendingSecondFactorKind::Sms(body) = pending.kind else { panic!() };
+            assert_eq!(body.phone_number.id, 7);
+            assert_eq!(body.mode, "sms");
+            assert!(body.security_code.is_none());
+        }
+    }
+
+    #[test]
+    fn normal_methods_preserve_phone_identity_and_device_option() {
+        let extras = parse_auth_extras(200, PHONE).unwrap();
+        let LoginStep::ChooseSecondFactor(methods) = second_factor_step(true, extras).unwrap() else { panic!() };
+        assert!(matches!(methods.as_slice(), [SecondFactorMethod::TrustedDevice, SecondFactorMethod::Sms { phone_id: 7, .. }]));
+    }
+
+    #[test]
+    fn automatically_sent_sms_without_a_phone_is_an_error() {
+        assert!(matches!(parse_auth_extras(201, NO_PHONES), Err(Error::NoTrustedPhoneNumbers)));
+    }
+
+    #[test]
+    fn http_failure_cannot_become_a_verification_challenge() {
+        for status in [400, 401, 403, 429, 500] {
+            assert!(matches!(parse_auth_extras(status, PHONE), Err(Error::FailedGetting2FAConfig)));
+        }
     }
 }

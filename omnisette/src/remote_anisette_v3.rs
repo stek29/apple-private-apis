@@ -287,9 +287,7 @@ impl AnisetteClient {
         }
 
         loop {
-            let Some(Ok(data)) = connection.next().await else {
-                continue
-            };
+            let data = next_provisioning_frame(&mut connection).await?;
             if data.is_text() {
                 let txt = data.to_text().unwrap();
                 let msg: ProvisionInput = serde_json::from_str(txt)?;
@@ -353,8 +351,6 @@ impl AnisetteClient {
                         break;
                     }
                 }
-            } else if data.is_close() {
-                break;
             }
         }
 
@@ -423,3 +419,68 @@ impl AnisetteProvider for RemoteAnisetteProviderV3 {
 
 
 
+
+
+async fn next_provisioning_frame<S>(connection: &mut S) -> Result<Message, AnisetteError>
+where
+    S: futures_util::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
+{
+    use tokio_tungstenite::tungstenite::Error as WsError;
+    match connection.next().await {
+        Some(Ok(Message::Close(_))) | None => Err(AnisetteError::WsError(WsError::ConnectionClosed)),
+        Some(Ok(frame)) => Ok(frame),
+        Some(Err(error)) => Err(AnisetteError::WsError(error)),
+    }
+}
+
+#[cfg(test)]
+mod provisioning_stream_tests {
+    use super::*;
+    use futures_util::{stream, FutureExt};
+    use std::task::Poll;
+    use tokio_tungstenite::tungstenite::Error as WsError;
+
+    #[tokio::test]
+    async fn eof_is_an_error_without_spinning() {
+        let mut polls = 0;
+        let mut input = stream::poll_fn(|_| {
+            polls += 1;
+            assert_eq!(polls, 1, "EOF stream polled again without yielding");
+            Poll::Ready(None)
+        });
+        assert!(matches!(next_provisioning_frame(&mut input).await,
+                         Err(AnisetteError::WsError(WsError::ConnectionClosed))));
+    }
+
+    #[tokio::test]
+    async fn transport_error_is_returned_without_spinning() {
+        let mut polls = 0;
+        let mut input = stream::poll_fn(|_| {
+            polls += 1;
+            assert_eq!(polls, 1, "Failed stream polled again without yielding");
+            Poll::Ready(Some(Err(WsError::AlreadyClosed)))
+        });
+        assert!(matches!(next_provisioning_frame(&mut input).await,
+                         Err(AnisetteError::WsError(WsError::AlreadyClosed))));
+    }
+
+    #[tokio::test]
+    async fn close_before_success_is_an_error() {
+        let mut input = stream::iter([Ok(Message::Close(None))]);
+        assert!(matches!(next_provisioning_frame(&mut input).await,
+                         Err(AnisetteError::WsError(WsError::ConnectionClosed))));
+    }
+
+    #[tokio::test]
+    async fn valid_message_is_preserved() {
+        let frame = Message::Text(r#"{"result":"GiveIdentifier"}"#.to_owned());
+        let mut input = stream::iter([Ok(frame.clone())]);
+        assert_eq!(next_provisioning_frame(&mut input).await.unwrap(), frame);
+    }
+
+    #[test]
+    fn pending_connection_yields_to_caller() {
+        let mut input = stream::pending();
+        assert!(next_provisioning_frame(&mut input).now_or_never().is_none());
+    }
+}
