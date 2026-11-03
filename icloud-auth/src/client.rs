@@ -1134,15 +1134,7 @@ impl<T: AnisetteProvider> AppleAccount<T> {
         self.username = Some(decoded_spd.get("acname").expect("No account name?").as_string().unwrap().to_string());
         self.spd = Some(decoded_spd);
 
-        if let Some(plist::Value::String(s)) = status.get("au") {
-            return match s.as_str() {
-                "trustedDeviceSecondaryAuth" => Ok(LoginState::NeedsDevice2FA),
-                "secondaryAuth" => Ok(LoginState::NeedsSMS2FA),
-                _unk => Ok(LoginState::NeedsExtraStep(_unk.to_string()))
-            }
-        }
-
-        Ok(LoginState::LoggedIn)
+        login_state_from_status(status)
     }
 
     fn create_session_key(usr: &SrpClientVerifier<Sha256>, name: &str) -> Vec<u8> {
@@ -1456,6 +1448,26 @@ fn parse_auth_extras(status: u16, body: &[u8]) -> Result<AuthenticationExtras, E
     Ok(extras)
 }
 
+fn login_state_from_status(status: &Dictionary) -> Result<LoginState, Error> {
+    if let Some(Value::String(auth_type)) = status.get("au") {
+        return Ok(match auth_type.as_str() {
+            "trustedDeviceSecondaryAuth" => LoginState::NeedsDevice2FA,
+            "secondaryAuth" => LoginState::NeedsSMS2FA,
+            other => LoginState::NeedsExtraStep(other.to_string()),
+        });
+    }
+    // Current GSA can push a trusted-device code and return only hsc=409.
+    // Enter verification directly; requesting another delivery can fail or rate-limit.
+    match status.get("hsc") {
+        None => Ok(LoginState::LoggedIn), // Legacy responses omit hsc.
+        Some(value) => match value.as_signed_integer().ok_or(Error::Parse)? {
+            200 => Ok(LoginState::LoggedIn),
+            409 => Ok(LoginState::Needs2FAVerification),
+            code => Err(Error::AuthSrpWithMessage(code, "Unexpected Apple authentication status".into())),
+        },
+    }
+}
+
 fn second_factor_step(trusted_device: bool, extras: AuthenticationExtras) -> Result<LoginStep, Error> {
     if let Some(LoginState::NeedsSMS2FAVerification(body)) = extras.new_state {
         return Ok(LoginStep::EnterCode(PendingSecondFactor::sms(body)));
@@ -1476,6 +1488,38 @@ mod attended_two_factor_tests {
     use super::*;
     const NO_PHONES: &[u8] = br#"{"trustedPhoneNumbers":[]}"#;
     const PHONE: &[u8] = br#"{"trustedPhoneNumbers":[{"numberWithDialCode":"+1 *** ** 42","lastTwoDigits":"42","pushMode":"sms","id":7}]}"#;
+
+    #[test]
+    fn pushed_code_without_au_requires_verification() {
+        let status = Dictionary::from_iter([("hsc", Value::Integer(409.into()))]);
+        assert!(matches!(login_state_from_status(&status), Ok(LoginState::Needs2FAVerification)));
+    }
+
+    #[test]
+    fn successful_and_legacy_statuses_still_complete() {
+        for status in [Dictionary::new(), Dictionary::from_iter([("hsc", Value::Integer(200.into()))])] {
+            assert!(matches!(login_state_from_status(&status), Ok(LoginState::LoggedIn)));
+        }
+    }
+
+    #[test]
+    fn explicit_legacy_method_and_account_action_are_preserved() {
+        for (auth, expected) in [("trustedDeviceSecondaryAuth", "device"), ("secondaryAuth", "sms"), ("repair", "action")] {
+            let status = Dictionary::from_iter([("hsc", Value::Integer(409.into())), ("au", Value::String(auth.into()))]);
+            match (login_state_from_status(&status).unwrap(), expected) {
+                (LoginState::NeedsDevice2FA, "device") | (LoginState::NeedsSMS2FA, "sms") | (LoginState::NeedsExtraStep(_), "action") => (),
+                _ => panic!("legacy method must remain available"),
+            }
+        }
+    }
+
+    #[test]
+    fn unsuccessful_or_malformed_status_never_claims_login() {
+        let denied = Dictionary::from_iter([("hsc", Value::Integer(403.into()))]);
+        assert!(matches!(login_state_from_status(&denied), Err(Error::AuthSrpWithMessage(403, _))));
+        let malformed = Dictionary::from_iter([("hsc", Value::String("private-response-placeholder".into()))]);
+        assert!(matches!(login_state_from_status(&malformed), Err(Error::Parse)));
+    }
 
     #[test]
     fn trusted_device_without_sms_numbers_is_available() {
