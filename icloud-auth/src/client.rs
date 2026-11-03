@@ -670,6 +670,11 @@ impl<T: AnisetteProvider> AppleAccount<T> {
             PendingSecondFactorKind::TrustedDevice => self.verify_2fa(code).await?,
             PendingSecondFactorKind::Sms(body) => self.verify_sms_2fa(code, body).await?,
         };
+        let response = resume_verified_login(response, || async {
+            let username = self.username.clone().ok_or(Error::AuthSrp)?;
+            let password = self.hashed_password.clone().ok_or(Error::AuthSrp)?;
+            self.login_email_pass(&username, &password).await
+        }).await?;
         self.state_to_login_step(response).await
     }
 
@@ -1342,7 +1347,7 @@ impl<T: AnisetteProvider> AppleAccount<T> {
             .send().await?;
 
         if res.status() != 200 {
-            error!("Security code failed, response: {}", res.text().await?);
+            error!("Security code verification failed: HTTP {}", res.status());
             return Err(Error::Bad2faCode);
         }
 
@@ -1513,6 +1518,74 @@ mod attended_two_factor_tests {
     fn http_failure_cannot_become_a_verification_challenge() {
         for status in [400, 401, 403, 429, 500] {
             assert!(matches!(parse_auth_extras(status, PHONE), Err(Error::FailedGetting2FAConfig)));
+        }
+    }
+}
+
+
+// Verification may accept the code without returning a PET. Match the
+// existing login loop with one final exchange, never an unbounded retry.
+async fn resume_verified_login<F, Fut>(state: LoginState, resume: F) -> Result<LoginState, Error>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<LoginState, Error>>,
+{
+    if matches!(state, LoginState::NeedsLogin) {
+        resume().await
+    } else {
+        Ok(state)
+    }
+}
+
+#[cfg(test)]
+mod verified_login_continuation_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[tokio::test]
+    async fn accepted_code_can_finish_the_login_exchange_once() {
+        let calls = Cell::new(0);
+        let result = resume_verified_login(LoginState::NeedsLogin, || async {
+            calls.set(calls.get() + 1);
+            Ok(LoginState::LoggedIn)
+        }).await.unwrap();
+        assert!(matches!(result, LoginState::LoggedIn));
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[tokio::test]
+    async fn continuation_failure_is_returned_without_retry() {
+        let calls = Cell::new(0);
+        let result = resume_verified_login(LoginState::NeedsLogin, || async {
+            calls.set(calls.get() + 1);
+            Err(Error::AuthSrp)
+        }).await;
+        assert!(matches!(result, Err(Error::AuthSrp)));
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[tokio::test]
+    async fn repeated_login_requirement_does_not_loop() {
+        let calls = Cell::new(0);
+        let result = resume_verified_login(LoginState::NeedsLogin, || async {
+            calls.set(calls.get() + 1);
+            Ok(LoginState::NeedsLogin)
+        }).await.unwrap();
+        assert!(matches!(result, LoginState::NeedsLogin));
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[tokio::test]
+    async fn completed_or_pending_verification_never_restarts_login() {
+        for state in [LoginState::LoggedIn, LoginState::NeedsDevice2FA, LoginState::NeedsSMS2FA,
+                      LoginState::Needs2FAVerification] {
+            let calls = Cell::new(0);
+            let result = resume_verified_login(state, || async {
+                calls.set(calls.get() + 1);
+                Err(Error::AuthSrp)
+            }).await;
+            assert!(result.is_ok());
+            assert_eq!(calls.get(), 0);
         }
     }
 }
